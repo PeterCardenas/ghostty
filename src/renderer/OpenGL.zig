@@ -2181,6 +2181,11 @@ pub fn changeConfig(self: *OpenGL, config: *DerivedConfig) !void {
 
     self.config.deinit();
     self.config = config.*;
+
+    if (self.gl_state) |*gl_state| {
+        gl_state.deinit();
+        gl_state.init(self.alloc, self.config, self.font_grid);
+    }
 }
 
 /// Set the screen size for rendering. This will update the projection
