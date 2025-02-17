@@ -297,10 +297,23 @@ pub const DerivedConfig = struct {
     ) !DerivedConfig {
         var arena = ArenaAllocator.init(alloc_gpa);
         errdefer arena.deinit();
+        var prng = std.rand.DefaultPrng.init(blk: {
+            var seed: u64 = undefined;
+            std.crypto.random.bytes(std.mem.asBytes(&seed));
+            break :blk seed;
+        });
+        const rand = prng.random();
         const alloc = arena.allocator();
 
         // Copy our shaders
         const custom_shaders = try config.@"custom-shader".clone(alloc);
+        const num_shaders = custom_shaders.value.items.len;
+        if (config.@"custom-shader-behavior" == .randomize and num_shaders > 0) {
+            const random_index = rand.intRangeAtMost(usize, 0, num_shaders - 1);
+            const selected_shader = custom_shaders.value.items[random_index];
+            custom_shaders.value.clearRetainingCapacity();
+            try custom_shaders.value.append(alloc, selected_shader);
+        }
 
         // Copy our font features
         const font_features = try config.@"font-feature".clone(alloc);
