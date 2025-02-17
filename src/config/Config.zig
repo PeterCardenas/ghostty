@@ -1997,6 +1997,8 @@ keybind: Keybinds = .{},
 /// (GTK only)
 @"bell-audio-volume": f64 = 0.5,
 
+@"custom-shader-behavior": CustomShaderBehavior = .randomize,
+
 /// Control the in-app notifications that Ghostty shows.
 ///
 /// On Linux (GTK), in-app notifications show up as toasts. Toasts appear
@@ -3741,6 +3743,11 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+};
+
+pub const CustomShaderBehavior = enum(c_int) {
+    stacked,
+    randomize,
 };
 
 /// Valid values for macos-non-native-fullscreen
