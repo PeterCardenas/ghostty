@@ -58,6 +58,11 @@ pub fn updateConfig(self: *ResizeOverlay, config: *const configpkg.Config) void 
     self.config = .init(config);
 }
 
+/// Ignore the next resize event.
+pub fn ignoreNext(self: *ResizeOverlay) void {
+    self.first = true;
+}
+
 /// De-initialize the ResizeOverlay. This removes any pending idlers/timers that
 /// may not have fired yet.
 pub fn deinit(self: *ResizeOverlay) void {

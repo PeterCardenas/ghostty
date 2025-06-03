@@ -313,6 +313,10 @@ precision_scroll: bool = false,
 /// Flag indicating whether the surface is in secure input mode.
 is_secure_input: bool = false,
 
+/// The timer used for recycling the GL area. See gtkRecycleTimer
+/// for details on why we have this.
+gl_recycle_timer: ?c_uint = null,
+
 /// The state of the key event while we're doing IM composition.
 /// See gtkKeyPressed for detailed descriptions.
 pub const IMKeyEvent = enum {
@@ -365,14 +369,11 @@ pub fn create(alloc: Allocator, app: *App, opts: Options) !*Surface {
 }
 
 pub fn init(self: *Surface, app: *App, opts: Options) !void {
-    const gl_area = gtk.GLArea.new();
-    const gl_area_widget = gl_area.as(gtk.Widget);
 
     // Create an overlay so we can layer the GL area with other widgets.
     const overlay = gtk.Overlay.new();
     errdefer overlay.unref();
     const overlay_widget = overlay.as(gtk.Widget);
-    overlay.setChild(gl_area_widget);
 
     // Overlay is not focusable, but the GL area is.
     overlay_widget.setFocusable(0);
@@ -388,16 +389,8 @@ pub fn init(self: *Surface, app: *App, opts: Options) !void {
     _ = overlay.as(gobject.Object).refSink();
     errdefer overlay.unref();
 
-    // We want the gl area to expand to fill the parent container.
-    gl_area_widget.setHexpand(1);
-    gl_area_widget.setVexpand(1);
-
-    // Various other GL properties
-    gl_area_widget.setCursorFromName("text");
-    gl_area.setRequiredVersion(3, 3);
-    gl_area.setHasStencilBuffer(0);
-    gl_area.setHasDepthBuffer(0);
-    gl_area.setUseEs(0);
+    const gl_area = self.initGLArea();
+    overlay.setChild(gl_area.as(gtk.Widget));
 
     // Key event controller will tell us about raw keypress events.
     const ec_key = gtk.EventControllerKey.new();
@@ -442,10 +435,6 @@ pub fn init(self: *Surface, app: *App, opts: Options) !void {
     // we call it manually from our own key controller.
     const im_context = gtk.IMMulticontext.new();
     errdefer im_context.unref();
-
-    // The GL area has to be focusable so that it can receive events
-    gl_area_widget.setFocusable(1);
-    gl_area_widget.setFocusOnClick(1);
 
     // Set up to handle items being dropped on our surface. Files can be dropped
     // from Nautilus and strings can be dropped from many programs.
@@ -531,39 +520,23 @@ pub fn init(self: *Surface, app: *App, opts: Options) !void {
     // Set our default mouse shape
     try self.setMouseShape(.text);
 
+    // Setup our timer to recycle our GL area.
+    self.gl_recycle_timer = glib.timeoutAdd(
+        // The interval is arbitrary, we should pick a number
+        // that works well for people without unnecessary churn.
+        // Currently: 1 hour.
+        // TODO(mitchellh): for the sake of testing, this is set
+        // to a lower value. Reset if we merge.
+        1000 * 60 * 5,
+        @ptrCast(&gtkRecycleTimer),
+        self,
+    );
+
     // GL events
-    _ = gtk.Widget.signals.realize.connect(
-        gl_area,
-        *Surface,
-        gtkRealize,
-        self,
-        .{},
-    );
-    _ = gtk.Widget.signals.unrealize.connect(
-        gl_area,
-        *Surface,
-        gtkUnrealize,
-        self,
-        .{},
-    );
     _ = gtk.Widget.signals.destroy.connect(
-        gl_area,
+        overlay.as(gtk.Widget),
         *Surface,
         gtkDestroy,
-        self,
-        .{},
-    );
-    _ = gtk.GLArea.signals.render.connect(
-        gl_area,
-        *Surface,
-        gtkRender,
-        self,
-        .{},
-    );
-    _ = gtk.GLArea.signals.resize.connect(
-        gl_area,
-        *Surface,
-        gtkResize,
         self,
         .{},
     );
@@ -681,6 +654,90 @@ pub fn init(self: *Surface, app: *App, opts: Options) !void {
     );
 }
 
+/// Create a new GtkGLArea for this surface. This will create
+/// the GL area, configure it, hook up all the signals, and
+/// return it.
+fn initGLArea(self: *Surface) *gtk.GLArea {
+    const gl_area = gtk.GLArea.new();
+    const gl_area_widget = gl_area.as(gtk.Widget);
+
+    // We want the gl area to expand to fill the parent container.
+    gl_area_widget.setHexpand(1);
+    gl_area_widget.setVexpand(1);
+
+    // The GL area has to be focusable so that it can receive events
+    gl_area_widget.setFocusable(1);
+    gl_area_widget.setFocusOnClick(1);
+
+    // Various other GL properties
+    gl_area_widget.setCursorFromName("text");
+    gl_area.setRequiredVersion(3, 3);
+    gl_area.setHasStencilBuffer(0);
+    gl_area.setHasDepthBuffer(0);
+    gl_area.setUseEs(0);
+    _ = gtk.Widget.signals.realize.connect(
+        gl_area,
+        *Surface,
+        gtkRealize,
+        self,
+        .{},
+    );
+    _ = gtk.Widget.signals.unrealize.connect(
+        gl_area,
+        *Surface,
+        gtkUnrealize,
+        self,
+        .{},
+    );
+    _ = gtk.GLArea.signals.render.connect(
+        gl_area,
+        *Surface,
+        gtkRender,
+        self,
+        .{},
+    );
+    _ = gtk.GLArea.signals.resize.connect(
+        gl_area,
+        *Surface,
+        gtkResize,
+        self,
+        .{},
+    );
+
+    return @ptrCast(gl_area);
+}
+
+/// This is the callback from the timer set to recycle our GLArea.
+/// This is a nasty hack to workaround some driver-specific memory
+/// leaks that we've seen. The idea is that by creating a new GLArea
+/// we reset a bunch of driver state and free up memory.
+///
+/// This doesn't affect all users, only specific hardware/driver
+/// configurations. It's a workaround until we can figure out if
+/// there is a better solution.
+///
+/// See: https://github.com/ghostty-org/ghostty/issues/2210
+fn gtkRecycleTimer(
+    self: *Surface,
+) callconv(.C) c_int {
+    // Create our new GL area and set it. This will trigger the
+    // destruction of the old one, too.
+    //
+    // NOTE: Our behavior currently depends on gtkUnrealize
+    // being called on the old gl area before gtkRealize is
+    // called on the new one. This seems to always be true
+    // but I don't know if its guaranteed.
+    self.gl_area = self.initGLArea();
+    self.overlay.setChild(self.gl_area.as(gtk.Widget));
+
+    // Ignore the next resize event since it will be for our
+    // new GL area.
+    self.resize_overlay.ignoreNext();
+
+    // Return true to keep the timer running.
+    return 1;
+}
+
 fn realize(self: *Surface) !void {
     // If this surface has already been realized, then we don't need to
     // reinitialize. This can happen if a surface is moved from one GDK surface
@@ -732,6 +789,12 @@ pub fn deinit(self: *Surface) void {
     if (self.title_text) |title| self.app.core_app.alloc.free(title);
     if (self.title_from_terminal) |title| self.app.core_app.alloc.free(title);
     if (self.pwd) |pwd| self.app.core_app.alloc.free(pwd);
+
+    // If we have a timer we need to remove it.
+    if (self.gl_recycle_timer) |timer| {
+        _ = glib.Source.remove(timer);
+        self.gl_recycle_timer = null;
+    }
 
     // We don't allocate anything if we aren't realized.
     if (!self.realized) return;
@@ -1485,7 +1548,7 @@ fn gtkResize(gl_area: *gtk.GLArea, width: c_int, height: c_int, self: *Surface) 
 }
 
 /// "destroy" signal for surface
-fn gtkDestroy(_: *gtk.GLArea, self: *Surface) callconv(.c) void {
+fn gtkDestroy(_: *gtk.Widget, self: *Surface) callconv(.c) void {
     log.debug("gl destroy", .{});
 
     const alloc = self.app.core_app.alloc;
