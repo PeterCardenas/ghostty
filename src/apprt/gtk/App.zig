@@ -261,6 +261,9 @@ pub fn init(self: *App, core_app: *CoreApp, opts: Options) !void {
         log.warn("setting GDK_DISABLE={s}", .{value[0 .. value.len - 1]});
         _ = internal_os.setenv("GDK_DISABLE", value[0 .. value.len - 1 :0]);
     }
+    const gsk_renderer = "cairo";
+    log.warn("setting GSK_RENDERER={s}", .{gsk_renderer});
+    _ = internal_os.setenv("GSK_RENDERER", gsk_renderer);
 
     adw.init();
 

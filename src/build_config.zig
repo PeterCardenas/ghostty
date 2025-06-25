@@ -62,7 +62,7 @@ pub const bundle_id = "com.mitchellh.ghostty";
 /// be used for real work. We'd love to have an option to run a build with
 /// safety checks that could be used for real work. This lets us do that.
 pub const slow_runtime_safety = std.debug.runtime_safety and switch (builtin.mode) {
-    .Debug => true,
+    .Debug => false,
     .ReleaseSafe,
     .ReleaseSmall,
     .ReleaseFast,
