@@ -2806,8 +2806,8 @@ const ScrollAmount = struct {
 /// negative is always down, left.
 pub fn scrollCallback(
     self: *Surface,
-    xoff: f64,
-    yoff: f64,
+    xoff_raw: f64,
+    yoff_raw: f64,
     scroll_mods: input.ScrollMods,
 ) !void {
     // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
@@ -2815,6 +2815,8 @@ pub fn scrollCallback(
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+    const xoff = if (xoff_raw == 0 and self.mouse.mods.shift) yoff_raw else xoff_raw;
+    const yoff = if (xoff_raw == 0 and self.mouse.mods.shift) 0 else xoff_raw;
 
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
