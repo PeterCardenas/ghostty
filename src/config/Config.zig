@@ -3859,7 +3859,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
             for (args) |arg_raw| {
                 const arg = std.mem.sliceTo(arg_raw, 0);
                 const copy = try arena_alloc.dupeZ(u8, arg);
-                try self._replay_steps.append(arena_alloc, .{ .arg = copy });
+                try self._replay_steps.append(arena_alloc, .{ .arg = .{ .arg = copy } });
                 try builder.append(arena_alloc, copy);
             }
 
@@ -4194,7 +4194,8 @@ fn loadTheme(self: *Config, theme: Theme) !void {
                 };
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
-                    .arg = v,
+                    .arg = v.arg,
+                    .location = v.location,
                 } };
             },
 
@@ -4210,6 +4211,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
                 item.* = .{ .conditional_arg = .{
                     .conditions = conds,
                     .arg = v.arg,
+                    .location = v.location,
                 } };
             },
         }
@@ -4449,7 +4451,7 @@ pub fn parseManuallyHook(
 
         while (iter.next()) |param| {
             const copy = try alloc.dupeZ(u8, param);
-            try self._replay_steps.append(alloc, .{ .arg = copy });
+            try self._replay_steps.append(alloc, .{ .arg = .{ .arg = copy } });
             try command.append(alloc, copy);
         }
 
@@ -4483,7 +4485,10 @@ pub fn parseManuallyHook(
     // Keep track of our input args for replay
     try self._replay_steps.append(
         alloc,
-        .{ .arg = try alloc.dupeZ(u8, arg) },
+        .{ .arg = .{
+            .arg = try alloc.dupeZ(u8, arg),
+            .location = try cli.Location.fromIter(iter, alloc),
+        } },
     );
 
     // If we didn't find a special case, continue parsing normally
@@ -4916,7 +4921,10 @@ fn probableCliEnvironment() bool {
 const Replay = struct {
     const Step = union(enum) {
         /// An argument to parse as if it came from the CLI or file.
-        arg: [:0]const u8,
+        arg: struct {
+            arg: [:0]const u8,
+            location: cli.Location = .none,
+        },
 
         /// A base path to expand relative paths against.
         expand: []const u8,
@@ -4927,6 +4935,7 @@ const Replay = struct {
         conditional_arg: struct {
             conditions: []const Conditional,
             arg: []const u8,
+            location: cli.Location = .none,
         },
 
         /// A diagnostic to be added to the new configuration when
@@ -4956,7 +4965,10 @@ const Replay = struct {
             return switch (self) {
                 .@"-e" => self,
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
-                .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
+                .arg => |v| .{ .arg = .{
+                    .arg = try alloc.dupeZ(u8, v.arg),
+                    .location = try v.location.clone(alloc),
+                } },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
                 .conditional_arg => |v| conditional: {
                     var conds = try alloc.alloc(Conditional, v.conditions.len);
@@ -4964,6 +4976,7 @@ const Replay = struct {
                     break :conditional .{ .conditional_arg = .{
                         .conditions = conds,
                         .arg = try alloc.dupe(u8, v.arg),
+                        .location = try v.location.clone(alloc),
                     } };
                 },
             };
@@ -5016,10 +5029,26 @@ const Replay = struct {
                         return v.arg;
                     },
 
-                    .arg => |arg| return arg,
+                    .arg => |v| return v.arg,
                     .@"-e" => return "-e",
                 }
             }
+        }
+
+        pub fn location(
+            self: *const Self,
+            alloc: Allocator,
+        ) Allocator.Error!?cli.Location {
+            // If we haven't started iterating yet, we have no location
+            if (self.idx == 0) return null;
+
+            // Get the previous step (the one we just returned from next())
+            const step = self.slice[self.idx - 1];
+            return switch (step) {
+                .arg => |v| try v.location.clone(alloc),
+                .conditional_arg => |v| try v.location.clone(alloc),
+                else => null,
+            };
         }
     };
 
@@ -10267,5 +10296,180 @@ test "compatibility: window new-window" {
             MacOSDockDropBehavior.@"new-window",
             cfg.@"macos-dock-drop-behavior",
         );
+    }
+}
+
+// Test iterator that supports location tracking
+const TestIteratorWithLocation = struct {
+    data: []const []const u8,
+    file_path: []const u8,
+    i: usize = 0,
+    last_line: usize = 0,
+
+    pub fn next(self: *TestIteratorWithLocation) ?[]const u8 {
+        if (self.i >= self.data.len) return null;
+        const result = self.data[self.i];
+        self.last_line = self.i + 1; // Line numbers are 1-based
+        self.i += 1;
+        return result;
+    }
+
+    pub fn location(self: *const TestIteratorWithLocation, alloc: Allocator) Allocator.Error!?cli.Location {
+        if (self.last_line == 0) return null;
+        return cli.Location{
+            .file = .{
+                .path = try alloc.dupe(u8, self.file_path),
+                .line = self.last_line,
+            },
+        };
+    }
+};
+
+test "replay steps preserve location information" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIteratorWithLocation = .{
+        .data = &.{
+            "--font-size=12",
+            "--window-padding-x=10",
+        },
+        .file_path = "/tmp/test-config",
+    };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Verify that replay steps have location information
+    var found_font_size = false;
+    var found_padding = false;
+
+    for (cfg._replay_steps.items) |step| {
+        switch (step) {
+            .arg => |arg_data| {
+                if (std.mem.indexOf(u8, arg_data.arg, "font-size") != null) {
+                    found_font_size = true;
+                    try testing.expect(arg_data.location != .none);
+                    if (arg_data.location == .file) {
+                        try testing.expectEqualStrings("/tmp/test-config", arg_data.location.file.path);
+                        try testing.expectEqual(@as(usize, 1), arg_data.location.file.line);
+                    }
+                }
+                if (std.mem.indexOf(u8, arg_data.arg, "window-padding-x") != null) {
+                    found_padding = true;
+                    try testing.expect(arg_data.location != .none);
+                    if (arg_data.location == .file) {
+                        try testing.expectEqualStrings("/tmp/test-config", arg_data.location.file.path);
+                        try testing.expectEqual(@as(usize, 2), arg_data.location.file.line);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(found_font_size);
+    try testing.expect(found_padding);
+}
+
+test "theme loading preserves location from source files" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const alloc_arena = arena.allocator();
+
+    // Setup our test theme
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var file = try td.dir.createFile("theme", .{});
+        defer file.close();
+        var writer = file.writer(&buf);
+        try writer.interface.writeAll(@embedFile("testdata/theme_simple"));
+        try writer.end();
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try td.dir.realpath("theme", &path_buf);
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIteratorWithLocation = .{
+        .data = &.{
+            try std.fmt.allocPrint(alloc_arena, "--theme={s}", .{path}),
+            "--font-size=14",
+        },
+        .file_path = "/tmp/test-with-theme",
+    };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Verify that user config location is preserved after theme loading
+    var found_font_size = false;
+
+    for (cfg._replay_steps.items) |step| {
+        switch (step) {
+            .arg => |arg_data| {
+                if (std.mem.indexOf(u8, arg_data.arg, "font-size") != null) {
+                    found_font_size = true;
+                    try testing.expect(arg_data.location != .none);
+                    // The location should point to our test config file
+                    if (arg_data.location == .file) {
+                        try testing.expectEqualStrings("/tmp/test-with-theme", arg_data.location.file.path);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(found_font_size);
+}
+
+test "replay iterator location method returns correct location" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    var it: TestIteratorWithLocation = .{
+        .data = &.{
+            "--font-size=12",
+            "--window-padding-x=10",
+        },
+        .file_path = "/tmp/test-location",
+    };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    // Test the replay iterator's location method
+    const slice = cfg._replay_steps.items;
+    var replay_it = Replay.iterator(slice, &cfg);
+
+    // First step should have location
+    _ = replay_it.next();
+    const loc1 = try replay_it.location(alloc);
+    try testing.expect(loc1 != null);
+    if (loc1) |l| {
+        defer if (l == .file) alloc.free(l.file.path);
+        try testing.expect(l == .file);
+        try testing.expectEqualStrings("/tmp/test-location", l.file.path);
+        try testing.expectEqual(@as(usize, 1), l.file.line);
+    }
+
+    // Second step should have different location
+    _ = replay_it.next();
+    const loc2 = try replay_it.location(alloc);
+    try testing.expect(loc2 != null);
+    if (loc2) |l| {
+        defer if (l == .file) alloc.free(l.file.path);
+        try testing.expect(l == .file);
+        try testing.expectEqualStrings("/tmp/test-location", l.file.path);
+        try testing.expectEqual(@as(usize, 2), l.file.line);
     }
 }
